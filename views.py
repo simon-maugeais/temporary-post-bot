@@ -38,7 +38,7 @@ class LifetimeView(discord.ui.View):
         self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item
     ) -> None:
         logger.error(
-            "Lifetime interaction failed for thread %s", interaction.channel_id,
+            "Lifetime interaction failed in channel %s", interaction.channel_id,
             exc_info=(type(error), error, error.__traceback__),
         )
         content = "Something went wrong. Please try again; any saved expiration remains scheduled."
@@ -48,4 +48,4 @@ class LifetimeView(discord.ui.View):
             else:
                 await interaction.response.send_message(content, ephemeral=True)
         except discord.HTTPException:
-            logger.exception("Could not report interaction error for thread %s", interaction.channel_id)
+            logger.exception("Could not report interaction error in channel %s", interaction.channel_id)

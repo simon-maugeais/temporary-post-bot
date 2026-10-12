@@ -20,6 +20,7 @@ class TemporaryPostBot(discord.Client):
     def __init__(self, settings: Settings) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
+        intents.guild_messages = bool(settings.text_channel_ids)
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.database = Database(settings.database_path)
         self.posts = PostService(self, self.database, settings, datetime.now(UTC))
@@ -43,7 +44,25 @@ class TemporaryPostBot(discord.Client):
         logger.warning("Disconnected from Discord; saved schedules remain in SQLite")
 
     async def on_thread_create(self, thread: discord.Thread) -> None:
-        await self.posts.safely_detect_thread(thread)
+        if not await self.posts.safely_detect_thread(thread):
+            self.worker.request_recovery()
+
+    async def on_message(self, message: discord.Message) -> None:
+        if not await self.posts.safely_detect_message(message):
+            self.worker.request_recovery()
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        await self._message_deleted(payload.message_id)
+
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
+        for message_id in payload.message_ids:
+            await self._message_deleted(message_id)
+
+    async def _message_deleted(self, message_id: int) -> None:
+        try:
+            await self.posts.message_deleted(message_id)
+        except Exception as error:
+            self.posts.log_failure("manual message deletion", message_id, error)
 
     async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
         try:
@@ -77,7 +96,7 @@ def main() -> None:
             raise ValueError("LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL.")
         logging.getLogger().setLevel(level)
         logging.getLogger("discord.http").setLevel(logging.INFO)
-        logger.info("Starting temporary Forum post bot")
+        logger.info("Starting temporary post bot (Forums and text channels)")
         asyncio.run(run_bot(settings))
     except ValueError as error:
         logger.error("Configuration error: %s", error)

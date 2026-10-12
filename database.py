@@ -10,6 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 PostStatus = Literal["pending_author", "awaiting_selection", "scheduled", "deleted", "ignored"]
+PostKind = Literal["forum_thread", "text_message"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,12 +28,31 @@ class Post:
     default_applied: bool
     needs_sync: bool
     deleted_at: int | None
+    kind: PostKind = "forum_thread"
+    target_deleted: bool = False
+
+    @property
+    def target_id(self) -> int:
+        return self.thread_id
+
+    @property
+    def channel_id(self) -> int:
+        return self.forum_channel_id
+
+    @property
+    def interaction_channel_id(self) -> int:
+        return self.target_id if self.kind == "forum_thread" else self.channel_id
+
+    @property
+    def noun(self) -> str:
+        return "post" if self.kind == "forum_thread" else "message"
 
     @classmethod
     def from_row(cls, row: aiosqlite.Row) -> Post:
         values = dict(row)
         values["default_applied"] = bool(values["default_applied"])
         values["needs_sync"] = bool(values["needs_sync"])
+        values["target_deleted"] = bool(values["target_deleted"])
         return cls(**values)
 
 
@@ -72,13 +92,27 @@ class Database:
                 default_applied INTEGER NOT NULL DEFAULT 0,
                 needs_sync INTEGER NOT NULL DEFAULT 1,
                 deleted_at INTEGER,
+                kind TEXT NOT NULL DEFAULT 'forum_thread'
+                    CHECK (kind IN ('forum_thread', 'text_message')),
+                target_deleted INTEGER NOT NULL DEFAULT 0,
                 CHECK (status != 'scheduled' OR expires_at IS NOT NULL),
                 CHECK (status NOT IN ('awaiting_selection', 'scheduled') OR author_id IS NOT NULL)
             );
             CREATE INDEX IF NOT EXISTS posts_expiration ON posts(status, expires_at);
             CREATE INDEX IF NOT EXISTS posts_selection ON posts(status, selection_deadline);
             CREATE INDEX IF NOT EXISTS posts_sync ON posts(needs_sync, status);
+            CREATE UNIQUE INDEX IF NOT EXISTS posts_prompt ON posts(prompt_message_id);
         """)
+        async with self.connection.execute("PRAGMA table_info(posts)") as cursor:
+            columns = {row["name"] for row in await cursor.fetchall()}
+        if "kind" not in columns:
+            await self.execute(
+                """ALTER TABLE posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'forum_thread'
+                CHECK (kind IN ('forum_thread', 'text_message'))"""
+            )
+            logger.info("Migrated existing posts to support text messages")
+        if "target_deleted" not in columns:
+            await self.execute("ALTER TABLE posts ADD COLUMN target_deleted INTEGER NOT NULL DEFAULT 0")
         await self.execute("UPDATE posts SET needs_sync = 1 WHERE status = 'awaiting_selection'")
         logger.info("SQLite initialized at %s", self.path)
 
@@ -102,6 +136,34 @@ class Database:
     async def get_post(self, thread_id: int) -> Post | None:
         posts = await self._posts("SELECT * FROM posts WHERE thread_id = ?", (thread_id,))
         return posts[0] if posts else None
+
+    async def get_post_by_prompt(self, message_id: int) -> Post | None:
+        posts = await self._posts(
+            "SELECT * FROM posts WHERE prompt_message_id = ?", (message_id,),
+        )
+        return posts[0] if posts else None
+
+    async def record_message(
+        self,
+        *,
+        message_id: int,
+        guild_id: int,
+        channel_id: int,
+        author_id: int,
+        created_at: int,
+        selection_timeout: int,
+        default_lifetime: int,
+    ) -> bool:
+        changed = await self.execute(
+            """INSERT INTO posts (
+                thread_id, guild_id, forum_channel_id, author_id, created_at,
+                selection_deadline, default_expires_at, status, kind
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'awaiting_selection', 'text_message')
+            ON CONFLICT(thread_id) DO NOTHING""",
+            (message_id, guild_id, channel_id, author_id, created_at,
+             created_at + selection_timeout, created_at + default_lifetime),
+        )
+        return changed == 1
 
     async def record_thread(
         self,
@@ -137,7 +199,7 @@ class Database:
             """UPDATE posts SET status = 'scheduled', expires_at = created_at + ?,
             default_applied = 0, needs_sync = 1
             WHERE thread_id = ? AND author_id = ? AND status = 'awaiting_selection'
-            AND selection_deadline > ?""",
+            AND selection_deadline > ? AND target_deleted = 0""",
             (seconds, thread_id, author_id, now),
         )
         return changed == 1
@@ -146,7 +208,8 @@ class Database:
         changed = await self.execute(
             """UPDATE posts SET status = 'scheduled', expires_at = default_expires_at,
             default_applied = 1, needs_sync = 1
-            WHERE thread_id = ? AND status = 'awaiting_selection' AND selection_deadline <= ?""",
+            WHERE thread_id = ? AND status = 'awaiting_selection' AND selection_deadline <= ?
+            AND target_deleted = 0""",
             (thread_id, now),
         )
         return changed == 1
@@ -177,6 +240,21 @@ class Database:
 
     async def mark_synced(self, thread_id: int) -> None:
         await self.execute("UPDATE posts SET needs_sync = 0 WHERE thread_id = ?", (thread_id,))
+
+    async def request_sync(self, target_id: int) -> None:
+        await self.execute(
+            """UPDATE posts SET needs_sync = 1 WHERE thread_id = ?
+            AND status IN ('awaiting_selection', 'scheduled') AND target_deleted = 0""",
+            (target_id,),
+        )
+
+    async def mark_message_deleted(self, message_id: int, now: int) -> None:
+        await self.execute(
+            """UPDATE posts SET target_deleted = 1, status = 'scheduled',
+            expires_at = ?, needs_sync = 0 WHERE thread_id = ? AND kind = 'text_message'
+            AND status NOT IN ('deleted', 'ignored')""",
+            (now, message_id),
+        )
 
     async def mark_deleted(self, thread_id: int, now: int) -> None:
         await self.execute(
