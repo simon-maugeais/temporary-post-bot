@@ -16,6 +16,7 @@ class ExpirationWorker:
     def __init__(self, service: PostService) -> None:
         self.service = service
         self._recovery_needed = True
+        self._text_recovery_cursors: dict[int, int] = {}
         self.run.change_interval(seconds=service.settings.check_interval_seconds)
 
     def request_recovery(self) -> None:
@@ -59,21 +60,22 @@ class ExpirationWorker:
         now = utc_timestamp()
         for post in await self.service.database.overdue_selections(now):
             await self._attempt(
-                "default lifetime", post.thread_id,
-                lambda post=post: self.service.apply_default(post.thread_id, now),
+                "default lifetime", post.target_id,
+                lambda post=post: self.service.apply_default(post.target_id, now),
             )
         for post in await self.service.database.expired_posts(now):
             await self._attempt(
-                "expiration deletion (will retry)", post.thread_id,
-                lambda post=post: self.service.delete_expired(post.thread_id, now),
+                "expiration deletion (will retry)", post.target_id,
+                lambda post=post: self.service.delete_expired(post.target_id, now),
             )
         if self._recovery_needed:
             self._recovery_needed = False
             try:
                 await self.recover_new_threads()
+                await self.recover_new_messages()
             except Exception:
                 self._recovery_needed = True
-                logger.exception("Thread recovery failed; retrying next worker cycle")
+                logger.exception("Post recovery failed; retrying next worker cycle")
         for guild in self.service.client.guilds:
             for thread in guild.threads:
                 await self.service.safely_detect_thread(thread)
@@ -81,8 +83,8 @@ class ExpirationWorker:
             if post.status == "scheduled" and post.expires_at is not None and post.expires_at <= utc_timestamp():
                 continue
             await self._attempt(
-                "post message synchronization (will retry)", post.thread_id,
-                lambda post=post: self.service.sync_post(post.thread_id),
+                "post message synchronization (will retry)", post.target_id,
+                lambda post=post: self.service.sync_post(post.target_id),
             )
 
     async def recover_new_threads(self) -> None:
@@ -135,3 +137,37 @@ class ExpirationWorker:
             self.request_recovery()
         else:
             logger.info("Thread recovery completed; pre-start posts without database records were ignored")
+
+    async def recover_new_messages(self) -> None:
+        failed = False
+        for channel_id in self.service.settings.text_channel_ids:
+            try:
+                async with asyncio.timeout(30):
+                    channel = await self.service.client.fetch_channel(channel_id)
+                    if not isinstance(channel, discord.TextChannel) or channel.type != discord.ChannelType.text:
+                        logger.error("Configured channel %s is not a standard text channel", channel_id)
+                        continue
+                    member = channel.guild.me
+                    if member is not None:
+                        permissions = channel.permissions_for(member)
+                        missing = [
+                            name for name in (
+                                "view_channel", "read_message_history", "send_messages", "manage_messages",
+                            ) if not getattr(permissions, name)
+                        ]
+                        if missing:
+                            logger.error("Text channel %s is missing bot permissions: %s", channel_id, ", ".join(missing))
+                    cursor = self._text_recovery_cursors.get(channel_id)
+                    after = discord.Object(id=cursor) if cursor is not None else self.service.started_at
+                    async for message in channel.history(limit=None, after=after, oldest_first=True):
+                        if not await self.service.safely_detect_message(message):
+                            failed = True
+                            break
+                        self._text_recovery_cursors[channel_id] = message.id
+            except Exception as error:
+                self.service.log_failure("text message recovery", channel_id, error)
+                failed = True
+        if failed:
+            self.request_recovery()
+        elif self.service.settings.text_channel_ids:
+            logger.info("Text message recovery completed; pre-start untracked messages were ignored")

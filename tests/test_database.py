@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -93,3 +94,41 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.database.get_post(11)).status, "ignored")
         self.assertEqual(await self.database.posts_to_sync(), [])
         self.assertEqual(await self.database.overdue_selections(999999), [])
+
+    async def test_legacy_database_migration_preserves_forum_schedule(self) -> None:
+        path = Path(self.directory.name) / "legacy.sqlite3"
+        with sqlite3.connect(path) as connection:
+            connection.executescript("""
+                CREATE TABLE posts (
+                    thread_id INTEGER PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    forum_channel_id INTEGER NOT NULL,
+                    author_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER,
+                    selection_deadline INTEGER NOT NULL,
+                    default_expires_at INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    prompt_message_id INTEGER,
+                    default_applied INTEGER NOT NULL DEFAULT 0,
+                    needs_sync INTEGER NOT NULL DEFAULT 1,
+                    deleted_at INTEGER
+                );
+                INSERT INTO posts VALUES (
+                    10, 20, 30, 40, 1000, 4600, 4600, 87400,
+                    'scheduled', 50, 0, 0, NULL
+                );
+            """)
+        migrated = Database(path)
+        try:
+            await migrated.open()
+            post = await migrated.get_post(10)
+            self.assertEqual(post.kind, "forum_thread")
+            self.assertFalse(post.target_deleted)
+            self.assertEqual(post.expires_at, 4600)
+            self.assertEqual(post.prompt_message_id, 50)
+            await migrated.close()
+            await migrated.open()
+            self.assertEqual((await migrated.get_post(10)).status, "scheduled")
+        finally:
+            await migrated.close()

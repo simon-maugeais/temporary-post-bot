@@ -60,3 +60,24 @@ class ConfigTests(unittest.TestCase):
                         discord_token="test-token", forum_channel_ids=frozenset({10}),
                         database_path=Path("test.sqlite3"), duration_options=options,
                     )
+
+    def test_text_only_configuration_is_supported(self) -> None:
+        with patch.dict(os.environ, {
+            "DISCORD_TOKEN": "test-token", "FORUM_CHANNEL_IDS": "",
+            "TEXT_CHANNEL_IDS": "31, 32,31",
+        }, clear=True):
+            with patch("config.load_dotenv"):
+                settings = load_settings()
+        self.assertEqual(settings.forum_channel_ids, frozenset())
+        self.assertEqual(settings.text_channel_ids, frozenset({31, 32}))
+
+    def test_invalid_or_overlapping_text_channel_ids_are_rejected(self) -> None:
+        for text_ids in ("invalid", "0", "10"):
+            with self.subTest(text_ids=text_ids):
+                with patch.dict(os.environ, {
+                    "DISCORD_TOKEN": "test-token", "FORUM_CHANNEL_IDS": "10",
+                    "TEXT_CHANNEL_IDS": text_ids,
+                }, clear=True):
+                    with patch("config.load_dotenv"):
+                        with self.assertRaises(ValueError):
+                            load_settings()
